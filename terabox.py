@@ -14,10 +14,11 @@ import urllib.parse
 from urllib.parse import urlparse
 from flask import Flask, render_template
 from threading import Thread
+import glob
 
 load_dotenv('config.env', override=True)
 logging.basicConfig(
-    level=logging.INFO,  
+    level=logging.INFO,
     format="[%(asctime)s - %(name)s - %(levelname)s] %(message)s - %(filename)s:%(lineno)d"
 )
 
@@ -54,7 +55,7 @@ API_HASH = os.environ.get('TELEGRAM_HASH', '')
 if len(API_HASH) == 0:
     logging.error("TELEGRAM_HASH variable is missing! Exiting now")
     exit(1)
-    
+
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 if len(BOT_TOKEN) == 0:
     logging.error("BOT_TOKEN variable is missing! Exiting now")
@@ -88,10 +89,10 @@ if USER_SESSION_STRING:
     SPLIT_SIZE = 4241280205
 
 VALID_DOMAINS = [
-    'terabox.com', 'nephobox.com', '4funbox.com', 'mirrobox.com', 
-    'momerybox.com', 'teraboxapp.com', '1024tera.com', 
-    'terabox.app', 'gibibox.com', 'goaibox.com', 'terasharelink.com', 
-    'teraboxlink.com', 'terafileshare.com'
+    'terabox.com', 'nephobox.com', '4funbox.com', 'mirrobox.com',
+    'momerybox.com', 'teraboxapp.com', '1024tera.com',
+    'terabox.app', 'gibibox.com', 'goaibox.com', 'terasharelink.com',
+    'teraboxlink.com', 'terafileshare.com', 'terafileshare.com'
 ]
 last_update_time = 0
 
@@ -105,7 +106,7 @@ async def is_user_member(client, user_id):
     except Exception as e:
         logging.error(f"Error checking membership status for user {user_id}: {e}")
         return False
-    
+
 def is_valid_url(url):
     parsed_url = urlparse(url)
     return any(parsed_url.netloc.endswith(domain) for domain in VALID_DOMAINS)
@@ -145,6 +146,122 @@ async def update_status_message(status_message, text):
     except Exception as e:
         logger.error(f"Failed to update status message: {e}")
 
+# ---------------------------
+# Helper: robustly locate the downloaded file on disk
+# ---------------------------
+def find_best_match_in_dirs(download_name, target_size, candidate_dirs):
+    """
+    Search candidate directories for files that either contain download_name or match size.
+    Returns best path or None.
+    """
+    best_path = None
+    best_score = -1
+    for base in candidate_dirs:
+        if not os.path.exists(base):
+            continue
+        for root, _, files in os.walk(base):
+            for fn in files:
+                try:
+                    full = os.path.join(root, fn)
+                    st = os.path.getsize(full)
+                except Exception:
+                    continue
+                score = 0
+                # if name fragment matches, give high score
+                if download_name and download_name in fn:
+                    score += 50
+                # size closeness
+                if target_size and target_size > 0:
+                    # small difference => high score
+                    diff = abs(target_size - st)
+                    # avoid division by zero
+                    score += max(0, 40 - (diff / (1024*1024)))  # lower weight with MB difference
+                # Prefer existing exact match
+                if score > best_score:
+                    best_score = score
+                    best_path = full
+    return best_path
+
+def get_downloaded_file_path(download):
+    """
+    Given an aria2p Download object, try multiple strategies to find the real file path:
+      1. Check download.files paths for existence.
+      2. Wait and refresh (a few retries) in case filesystem is being finalized.
+      3. Search common directories for best match by name/size.
+    """
+    # 1) Try files listed by aria2
+    try:
+        files = list(download.files)
+    except Exception:
+        files = []
+
+    for f in files:
+        try:
+            if hasattr(f, "path") and f.path and os.path.exists(f.path):
+                return f.path
+        except Exception:
+            continue
+
+    # 2) Retry a few times after short waits (some setups finalize file after aria2 RPC shows complete)
+    retries = 3
+    for i in range(retries):
+        time.sleep(1 + i)  # incremental wait
+        download.update()
+        try:
+            files = list(download.files)
+        except Exception:
+            files = []
+        for f in files:
+            try:
+                if hasattr(f, "path") and f.path and os.path.exists(f.path):
+                    return f.path
+            except Exception:
+                continue
+
+    # 3) Scan likely download directories to find best match by name/size
+    candidate_dirs = [
+        os.getcwd(),
+        "/root",
+        "/root/Aster",
+        "/app",
+        "/downloads",
+        "/download",
+        "/tmp",
+        "/var/www",
+    ]
+
+    # use download.name and total_length heuristics
+    download_name = getattr(download, "name", "") or ""
+    target_size = getattr(download, "total_length", 0) or 0
+
+    best = find_best_match_in_dirs(download_name, target_size, candidate_dirs)
+    if best:
+        return best
+
+    # 4) As a last resort try glob in candidate dirs for anything recently modified
+    for base in candidate_dirs:
+        try:
+            pattern = os.path.join(base, "*")
+            candidates = glob.glob(pattern)
+            candidates = sorted(candidates, key=os.path.getmtime, reverse=True)
+            for c in candidates[:20]:  # only check top recent 20
+                if os.path.isfile(c):
+                    # if size matches roughly, return
+                    try:
+                        if target_size and abs(os.path.getsize(c) - target_size) < max(1024*10, target_size * 0.01):
+                            return c
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+
+    # nothing found
+    return None
+
+# ---------------------------
+# End helpers
+# ---------------------------
+
 @app.on_message(filters.text)
 async def handle_message(client: Client, message: Message):
     if message.text.startswith('/'):
@@ -160,7 +277,7 @@ async def handle_message(client: Client, message: Message):
         reply_markup = InlineKeyboardMarkup([[join_button]])
         await message.reply_text("ʏᴏᴜ ᴍᴜsᴛ ᴊᴏɪɴ ᴍʏ ᴄʜᴀɴɴᴇʟ ᴛᴏ ᴜsᴇ ᴍᴇ.", reply_markup=reply_markup)
         return
-    
+
     url = None
     for word in message.text.split():
         if is_valid_url(word):
@@ -173,12 +290,13 @@ async def handle_message(client: Client, message: Message):
 
     encoded_url = urllib.parse.quote(url)
     final_url = f"https://terabox-url-fixer.amir470517.workers.dev/?url={encoded_url}"
-    
+
     download = aria2.add_uris([final_url])
     status_message = await message.reply_text("sᴇɴᴅɪɴɢ ʏᴏᴜ ᴛʜᴇ ᴍᴇᴅɪᴀ...🤤")
 
     start_time = datetime.now()
 
+    # wait until aria2 thinks it's complete (but we will still validate the file path)
     while not download.is_complete:
         await asyncio.sleep(15)
         download.update()
@@ -196,7 +314,7 @@ async def handle_message(client: Client, message: Message):
             f"┠ sᴘᴇᴇᴅ: {format_size(download.download_speed)}/s\n"
             f"┠ ᴇᴛᴀ: {download.eta} | ᴇʟᴀᴘsᴇᴅ: {elapsed_minutes}m {elapsed_seconds}s\n"
             f"┖ ᴜsᴇʀ: <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> | ɪᴅ: {user_id}\n"
-            )
+        )
         while True:
             try:
                 await update_status_message(status_message, status_text)
@@ -205,7 +323,32 @@ async def handle_message(client: Client, message: Message):
                 logger.error(f"Flood wait detected! Sleeping for {e.value} seconds")
                 await asyncio.sleep(e.value)
 
-    file_path = download.files[0].path
+    # download is_complete from aria2; now find the real file path robustly
+    download.update()
+    file_path = get_downloaded_file_path(download)
+
+    # if still not found, try a few more tries (aria2 finalization edge cases)
+    if not file_path:
+        tries = 3
+        for i in range(tries):
+            await asyncio.sleep(1 + i)
+            download.update()
+            file_path = get_downloaded_file_path(download)
+            if file_path:
+                break
+
+    if not file_path:
+        # give user and logs a helpful error
+        err_text = (
+            "⚠️ Download completed but file was not found on disk.\n"
+            "This can happen if aria2 saved file under a different name/path or disk cleanup removed it.\n"
+            "Please check your aria2 download-dir and permissions."
+        )
+        await status_message.edit_text(err_text)
+        logger.error(f"File not found for aria2 download gid={download.gid}, name={download.name}, total_length={download.total_length}")
+        return
+
+    # Now we have a valid file_path
     caption = (
         f"✨ {download.name}\n"
         f"👤 ʟᴇᴇᴄʜᴇᴅ ʙʏ : <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a>\n"
@@ -231,7 +374,7 @@ async def handle_message(client: Client, message: Message):
                 logger.error(f"Error updating status: {e}")
 
     async def upload_progress(current, total):
-        progress = (current / total) * 100
+        progress = (current / total) * 100 if total else 0
         elapsed_time = datetime.now() - start_time
         elapsed_minutes, elapsed_seconds = divmod(elapsed_time.seconds, 60)
 
@@ -252,7 +395,7 @@ async def handle_message(client: Client, message: Message):
             original_ext = os.path.splitext(input_path)[1].lower() or '.mp4'
             start_time = datetime.now()
             last_progress_update = time.time()
-            
+
             proc = await asyncio.create_subprocess_exec(
                 'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                 '-of', 'default=noprint_wrappers=1:nokey=1', input_path,
@@ -261,16 +404,16 @@ async def handle_message(client: Client, message: Message):
             )
             stdout, _ = await proc.communicate()
             total_duration = float(stdout.decode().strip())
-            
+
             file_size = os.path.getsize(input_path)
             parts = math.ceil(file_size / split_size)
-            
+
             if parts == 1:
                 return [input_path]
-            
+
             duration_per_part = total_duration / parts
             split_files = []
-            
+
             for i in range(parts):
                 current_time = time.time()
                 if current_time - last_progress_update >= UPDATE_INTERVAL:
@@ -282,7 +425,7 @@ async def handle_message(client: Client, message: Message):
                     )
                     await update_status(status_message, status_text)
                     last_progress_update = current_time
-                
+
                 output_path = f"{output_prefix}.{i+1:03d}{original_ext}"
                 cmd = [
                     'xtra', '-y', '-ss', str(i * duration_per_part),
@@ -291,31 +434,36 @@ async def handle_message(client: Client, message: Message):
                     '-avoid_negative_ts', 'make_zero',
                     output_path
                 ]
-                
+
                 proc = await asyncio.create_subprocess_exec(*cmd)
                 await proc.wait()
                 split_files.append(output_path)
-            
+
             return split_files
         except Exception as e:
             logger.error(f"Split error: {e}")
             raise
 
     async def handle_upload():
-        file_size = os.path.getsize(file_path)
-        
+        try:
+            file_size = os.path.getsize(file_path)
+        except Exception as e:
+            logger.error(f"Failed to stat file {file_path}: {e}")
+            await status_message.edit_text("⚠️ Failed to read downloaded file. Aborting upload.")
+            return
+
         if file_size > SPLIT_SIZE:
             await update_status(
                 status_message,
                 f"✂️ Splitting {download.name} ({format_size(file_size)})"
             )
-            
+
             split_files = await split_video_with_ffmpeg(
                 file_path,
                 os.path.splitext(file_path)[0],
                 SPLIT_SIZE
             )
-            
+
             try:
                 for i, part in enumerate(split_files):
                     part_caption = f"{caption}\n\nPart {i+1}/{len(split_files)}"
@@ -324,10 +472,10 @@ async def handle_message(client: Client, message: Message):
                         f"📤 Uploading part {i+1}/{len(split_files)}\n"
                         f"{os.path.basename(part)}"
                     )
-                    
+
                     if USER_SESSION_STRING:
                         sent = await user.send_video(
-                            DUMP_CHAT_ID, part, 
+                            DUMP_CHAT_ID, part,
                             caption=part_caption,
                             progress=upload_progress
                         )
@@ -344,18 +492,24 @@ async def handle_message(client: Client, message: Message):
                             message.chat.id, sent.video.file_id,
                             caption=part_caption
                         )
-                    os.remove(part)
+                    try:
+                        os.remove(part)
+                    except Exception:
+                        pass
             finally:
                 for part in split_files:
-                    try: os.remove(part)
-                    except: pass
+                    try:
+                        if os.path.exists(part):
+                            os.remove(part)
+                    except:
+                        pass
         else:
             await update_status(
                 status_message,
                 f"📤 Uploading {download.name}\n"
                 f"Size: {format_size(file_size)}"
             )
-            
+
             if USER_SESSION_STRING:
                 sent = await user.send_video(
                     DUMP_CHAT_ID, file_path,
@@ -376,7 +530,10 @@ async def handle_message(client: Client, message: Message):
                     caption=caption
                 )
         if os.path.exists(file_path):
-            os.remove(file_path)
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
 
     start_time = datetime.now()
     await handle_upload()
@@ -392,29 +549,4 @@ flask_app = Flask(__name__)
 @flask_app.route('/')
 def home():
     return render_template("index.html")
-
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
-def keep_alive():
-    Thread(target=run_flask).start()
-
-async def start_user_client():
-    if user:
-        await user.start()
-        logger.info("User client started.")
-
-def run_user():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(start_user_client())
-
-if __name__ == "__main__":
-    keep_alive()
-
-    if user:
-        logger.info("Starting user client...")
-        Thread(target=run_user).start()
-
-    logger.info("Starting bot client...")
-    app.run()
+                                            
